@@ -218,7 +218,13 @@ class ServerState:
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive_fast)
             clog.log("info", f"apply_update: step_system_prompts_async done in {time.time() - t0:.1f}s (close={close} ws.closed={ws.closed})")
             self.mimi.reset_streaming()
-            opus_reader_holder[0] = sphn.OpusStreamReader(self.mimi.sample_rate)
+            drained = 0
+            while True:
+                leftover = opus_reader.read_pcm()
+                if leftover is None or leftover.shape[-1] == 0:
+                    break
+                drained += leftover.shape[-1]
+            clog.log("info", f"apply_update: drained {drained} samples from opus reader")
             clog.log("info", f"apply_update: DONE total={time.time() - t0:.1f}s")
 
         async def recv_loop():
@@ -251,7 +257,7 @@ class ServerState:
                     if kind == 1:
                         payload = message[1:]
                         try:
-                            opus_reader_holder[0].append_bytes(payload)
+                            opus_reader.append_bytes(payload)
                         except ValueError as e:
                             clog.log("warning", f"recv_loop: append_bytes ValueError: {e}, breaking")
                             break
@@ -301,7 +307,7 @@ class ServerState:
                         all_pcm_data = None
                         continue
                     await asyncio.sleep(0.001)
-                    pcm = opus_reader_holder[0].read_pcm()
+                    pcm = opus_reader.read_pcm()
                     if pcm is None or pcm.shape[-1] == 0:
                         continue
                     if all_pcm_data is None:
@@ -358,7 +364,7 @@ class ServerState:
                 seed_all(seed)
 
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
-            opus_reader_holder = [sphn.OpusStreamReader(self.mimi.sample_rate)]
+            opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
