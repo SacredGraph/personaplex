@@ -179,8 +179,11 @@ class ServerState:
                 text_prompt += "\n\nContinue seamlessly. Do NOT greet / introduce yourself / mention changes."
             if upd.get("context_tail"):
                 text_prompt += "\n\nContext to continue from:\n" + upd["context_tail"]
-            self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if text_prompt else None
-            clog.log("info", f"apply_update: text_prompt_tokens set ({len(self.lm_gen.text_prompt_tokens) if self.lm_gen.text_prompt_tokens else 0} tokens)")
+            wrapped = wrap_with_system_tags(text_prompt) if text_prompt else None
+            self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrapped) if wrapped else None
+            n_tok = len(self.lm_gen.text_prompt_tokens) if self.lm_gen.text_prompt_tokens else 0
+            clog.log("info", f"apply_update: full text_prompt ({n_tok} tokens):\n  {wrapped}")
+
             voice_prompt = upd.get("voice_prompt")
             if voice_prompt and self.voice_prompt_dir is not None:
                 vp = os.path.join(self.voice_prompt_dir, voice_prompt)
@@ -190,10 +193,19 @@ class ServerState:
                 else:
                     self.lm_gen.load_voice_prompt(vp)
                 clog.log("info", f"apply_update: voice prompt loaded")
+            else:
+                clog.log("info", "apply_update: no voice_prompt change requested")
+
             clog.log("info", f"apply_update: resetting streaming (close={close} ws.closed={ws.closed})")
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
+
+            gen_state = self.lm_gen._streaming_state
+            clog.log("info", f"apply_update: after reset: lm_gen offset={gen_state.offset}, "
+                      f"text_prompt_tokens={'set' if self.lm_gen.text_prompt_tokens else 'None'} "
+                      f"({n_tok} tokens), "
+                      f"voice_prompt_embeddings={'set' if self.lm_gen.voice_prompt_embeddings is not None else 'None'}")
 
             last_keepalive = [0.0]
             keepalive_count = [0]
@@ -216,7 +228,12 @@ class ServerState:
 
             clog.log("info", f"apply_update: starting step_system_prompts_async (close={close} ws.closed={ws.closed})")
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive_fast)
-            clog.log("info", f"apply_update: step_system_prompts_async done in {time.time() - t0:.1f}s (close={close} ws.closed={ws.closed})")
+
+            gen_state = self.lm_gen._streaming_state
+            clog.log("info", f"apply_update: step_system_prompts_async done in {time.time() - t0:.1f}s "
+                      f"(close={close} ws.closed={ws.closed}) "
+                      f"lm_gen offset after prompts={gen_state.offset}")
+
             self.mimi.reset_streaming()
             drained = 0
             while True:
