@@ -27,6 +27,7 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+import json
 import random
 import os
 from pathlib import Path
@@ -170,6 +171,31 @@ class ServerState:
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
 
+        async def apply_update(upd: dict):
+            text_prompt = (upd.get("text_prompt") or "").strip()
+            if upd.get("no_greeting", True):
+                text_prompt += "\n\nContinue seamlessly. Do NOT greet / introduce yourself / mention changes."
+            if upd.get("context_tail"):
+                text_prompt += "\n\nContext to continue from:\n" + upd["context_tail"]
+            self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if text_prompt else None
+            voice_prompt = upd.get("voice_prompt")
+            if voice_prompt and self.voice_prompt_dir is not None:
+                vp = os.path.join(self.voice_prompt_dir, voice_prompt)
+                if vp.endswith(".pt"):
+                    self.lm_gen.load_voice_prompt_embeddings(vp)
+                else:
+                    self.lm_gen.load_voice_prompt(vp)
+            self.mimi.reset_streaming()
+            self.other_mimi.reset_streaming()
+            self.lm_gen.reset_streaming()
+
+            async def is_alive_fast():
+                return (not close) and (not ws.closed)
+
+            await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive_fast)
+            self.mimi.reset_streaming()
+            opus_reader_holder[0] = sphn.OpusStreamReader(self.mimi.sample_rate)
+
         async def recv_loop():
             nonlocal close
             try:
@@ -192,9 +218,18 @@ class ServerState:
                         clog.log("warning", "empty message")
                         continue
                     kind = message[0]
-                    if kind == 1:  # audio
+                    if kind == 1:
                         payload = message[1:]
-                        opus_reader.append_bytes(payload)
+                        opus_reader_holder[0].append_bytes(payload)
+                    elif kind == 3:
+                        try:
+                            payload = message[1:].decode("utf-8")
+                            update_dict = json.loads(payload)
+                            await pending_updates.put(update_dict)
+                            await ws.send_bytes(b"\x03OK")
+                        except Exception as e:
+                            err_msg = str(e).encode("utf-8")[:120]
+                            await ws.send_bytes(b"\x03ERR:" + err_msg)
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
@@ -207,8 +242,15 @@ class ServerState:
             while True:
                 if close:
                     return
+                upd = None
+                while not pending_updates.empty():
+                    upd = pending_updates.get_nowait()
+                if upd is not None:
+                    await apply_update(upd)
+                    all_pcm_data = None
+                    continue
                 await asyncio.sleep(0.001)
-                pcm = opus_reader.read_pcm()
+                pcm = opus_reader_holder[0].read_pcm()
                 if pcm.shape[-1] == 0:
                     continue
                 if all_pcm_data is None:
@@ -256,12 +298,13 @@ class ServerState:
         if len(request.query["voice_prompt"]) > 0:
             clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
         close = False
+        pending_updates: asyncio.Queue[dict] = asyncio.Queue()
         async with self.lock:
             if seed is not None and seed != -1:
                 seed_all(seed)
 
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
-            opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+            opus_reader_holder = [sphn.OpusStreamReader(self.mimi.sample_rate)]
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
