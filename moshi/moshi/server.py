@@ -200,6 +200,8 @@ class ServerState:
             nonlocal close
             try:
                 async for message in ws:
+                    if ws.closed:
+                        break
                     if message.type == aiohttp.WSMsgType.ERROR:
                         clog.log("error", f"{ws.exception()}")
                         break
@@ -220,18 +222,28 @@ class ServerState:
                     kind = message[0]
                     if kind == 1:
                         payload = message[1:]
-                        opus_reader_holder[0].append_bytes(payload)
+                        try:
+                            opus_reader_holder[0].append_bytes(payload)
+                        except ValueError:
+                            break
                     elif kind == 3:
                         try:
                             payload = message[1:].decode("utf-8")
                             update_dict = json.loads(payload)
                             await pending_updates.put(update_dict)
-                            await ws.send_bytes(b"\x03OK")
+                            if not ws.closed:
+                                await ws.send_bytes(b"\x03OK")
                         except Exception as e:
                             err_msg = str(e).encode("utf-8")[:120]
-                            await ws.send_bytes(b"\x03ERR:" + err_msg)
+                            if not ws.closed:
+                                try:
+                                    await ws.send_bytes(b"\x03ERR:" + err_msg)
+                                except Exception:
+                                    pass
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
+            except Exception as e:
+                clog.log("warning", f"recv_loop: {e}")
             finally:
                 close = True
                 clog.log("info", "connection closed")
