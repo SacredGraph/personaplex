@@ -309,6 +309,7 @@ class ServerState:
 
         async def opus_loop():
             all_pcm_data = None
+            frames_since_update = [0]
             try:
                 while True:
                     if close:
@@ -322,6 +323,7 @@ class ServerState:
                         await apply_update(upd)
                         clog.log("info", f"opus_loop: apply_update returned (close={close} ws.closed={ws.closed})")
                         all_pcm_data = None
+                        frames_since_update[0] = 0
                         continue
                     await asyncio.sleep(0.001)
                     pcm = opus_reader.read_pcm()
@@ -343,6 +345,9 @@ class ServerState:
                             tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                             if tokens is None:
                                 continue
+                            frames_since_update[0] += 1
+                            if frames_since_update[0] == 1:
+                                clog.log("info", f"opus_loop: FIRST FRAME generated after update (offset={self.lm_gen._streaming_state.offset})")
                             assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
                             main_pcm = self.mimi.decode(tokens[:, 1:9])
                             _ = self.other_mimi.decode(tokens[:, 1:9])
