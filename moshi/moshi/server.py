@@ -189,7 +189,17 @@ class ServerState:
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
 
+            last_keepalive = [0.0]
+
             async def is_alive_fast():
+                await asyncio.sleep(0)
+                now = time.time()
+                if now - last_keepalive[0] >= 2.0 and not ws.closed:
+                    try:
+                        await ws.send_bytes(b"\x02")
+                        last_keepalive[0] = now
+                    except Exception:
+                        pass
                 return (not close) and (not ws.closed)
 
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive_fast)
