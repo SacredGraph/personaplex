@@ -172,78 +172,103 @@ class ServerState:
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def apply_update(upd: dict):
+            t0 = time.time()
+            clog.log("info", f"apply_update: START upd keys={list(upd.keys())} close={close} ws.closed={ws.closed}")
             text_prompt = (upd.get("text_prompt") or "").strip()
             if upd.get("no_greeting", True):
                 text_prompt += "\n\nContinue seamlessly. Do NOT greet / introduce yourself / mention changes."
             if upd.get("context_tail"):
                 text_prompt += "\n\nContext to continue from:\n" + upd["context_tail"]
             self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if text_prompt else None
+            clog.log("info", f"apply_update: text_prompt_tokens set ({len(self.lm_gen.text_prompt_tokens) if self.lm_gen.text_prompt_tokens else 0} tokens)")
             voice_prompt = upd.get("voice_prompt")
             if voice_prompt and self.voice_prompt_dir is not None:
                 vp = os.path.join(self.voice_prompt_dir, voice_prompt)
+                clog.log("info", f"apply_update: loading voice prompt {vp}")
                 if vp.endswith(".pt"):
                     self.lm_gen.load_voice_prompt_embeddings(vp)
                 else:
                     self.lm_gen.load_voice_prompt(vp)
+                clog.log("info", f"apply_update: voice prompt loaded")
+            clog.log("info", f"apply_update: resetting streaming (close={close} ws.closed={ws.closed})")
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
 
             last_keepalive = [0.0]
+            keepalive_count = [0]
 
             async def is_alive_fast():
                 await asyncio.sleep(0)
+                alive = (not close) and (not ws.closed)
                 now = time.time()
                 if now - last_keepalive[0] >= 2.0 and not ws.closed:
                     try:
                         await ws.send_bytes(b"\x02")
                         last_keepalive[0] = now
-                    except Exception:
-                        pass
-                return (not close) and (not ws.closed)
+                        keepalive_count[0] += 1
+                        clog.log("info", f"apply_update: keepalive #{keepalive_count[0]} sent (elapsed={now - t0:.1f}s alive={alive})")
+                    except Exception as e:
+                        clog.log("warning", f"apply_update: keepalive send failed: {e}")
+                if not alive:
+                    clog.log("warning", f"apply_update: is_alive_fast returning False (close={close} ws.closed={ws.closed})")
+                return alive
 
+            clog.log("info", f"apply_update: starting step_system_prompts_async (close={close} ws.closed={ws.closed})")
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive_fast)
+            clog.log("info", f"apply_update: step_system_prompts_async done in {time.time() - t0:.1f}s (close={close} ws.closed={ws.closed})")
             self.mimi.reset_streaming()
             opus_reader_holder[0] = sphn.OpusStreamReader(self.mimi.sample_rate)
+            clog.log("info", f"apply_update: DONE total={time.time() - t0:.1f}s")
 
         async def recv_loop():
             nonlocal close
             try:
                 async for message in ws:
                     if ws.closed:
+                        clog.log("info", "recv_loop: ws.closed detected, breaking")
                         break
                     if message.type == aiohttp.WSMsgType.ERROR:
-                        clog.log("error", f"{ws.exception()}")
+                        clog.log("error", f"recv_loop: WS ERROR {ws.exception()}")
                         break
                     elif message.type == aiohttp.WSMsgType.CLOSED:
+                        clog.log("info", "recv_loop: got CLOSED message type")
                         break
                     elif message.type == aiohttp.WSMsgType.CLOSE:
+                        clog.log("info", f"recv_loop: got CLOSE message type (data={message.data} extra={message.extra})")
                         break
                     elif message.type != aiohttp.WSMsgType.BINARY:
-                        clog.log("error", f"unexpected message type {message.type}")
+                        clog.log("error", f"recv_loop: unexpected message type {message.type}")
                         continue
                     message = message.data
                     if not isinstance(message, bytes):
-                        clog.log("error", f"unsupported message type {type(message)}")
+                        clog.log("error", f"recv_loop: unsupported message type {type(message)}")
                         continue
                     if len(message) == 0:
-                        clog.log("warning", "empty message")
+                        clog.log("warning", "recv_loop: empty message")
                         continue
                     kind = message[0]
                     if kind == 1:
                         payload = message[1:]
                         try:
                             opus_reader_holder[0].append_bytes(payload)
-                        except ValueError:
+                        except ValueError as e:
+                            clog.log("warning", f"recv_loop: append_bytes ValueError: {e}, breaking")
                             break
                     elif kind == 3:
+                        clog.log("info", f"recv_loop: got 0x03 prompt update ({len(message)-1} bytes)")
                         try:
                             payload = message[1:].decode("utf-8")
                             update_dict = json.loads(payload)
+                            clog.log("info", f"recv_loop: parsed update keys={list(update_dict.keys())}, queuing")
                             await pending_updates.put(update_dict)
                             if not ws.closed:
                                 await ws.send_bytes(b"\x03OK")
+                                clog.log("info", "recv_loop: sent 0x03 OK ack")
+                            else:
+                                clog.log("warning", "recv_loop: ws.closed before sending ack")
                         except Exception as e:
+                            clog.log("error", f"recv_loop: 0x03 handling error: {e}")
                             err_msg = str(e).encode("utf-8")[:120]
                             if not ws.closed:
                                 try:
@@ -251,24 +276,28 @@ class ServerState:
                                 except Exception:
                                     pass
                     else:
-                        clog.log("warning", f"unknown message kind {kind}")
+                        clog.log("warning", f"recv_loop: unknown message kind {kind}")
+                clog.log("info", f"recv_loop: message loop ended (ws.closed={ws.closed})")
             except Exception as e:
-                clog.log("warning", f"recv_loop: {e}")
+                clog.log("warning", f"recv_loop: exception: {e}")
             finally:
                 close = True
-                clog.log("info", "connection closed")
+                clog.log("info", f"recv_loop: setting close=True (ws.closed={ws.closed})")
 
         async def opus_loop():
             all_pcm_data = None
             try:
                 while True:
                     if close:
+                        clog.log("info", f"opus_loop: close=True, returning (ws.closed={ws.closed})")
                         return
                     upd = None
                     while not pending_updates.empty():
                         upd = pending_updates.get_nowait()
                     if upd is not None:
+                        clog.log("info", f"opus_loop: drained update from queue, calling apply_update")
                         await apply_update(upd)
+                        clog.log("info", f"opus_loop: apply_update returned (close={close} ws.closed={ws.closed})")
                         all_pcm_data = None
                         continue
                     await asyncio.sleep(0.001)
@@ -305,7 +334,8 @@ class ServerState:
                             else:
                                 text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
             except Exception as e:
-                clog.log("warning", f"opus_loop: {e}")
+                import traceback
+                clog.log("warning", f"opus_loop: exception: {e}\n{traceback.format_exc()}")
 
         async def send_loop():
             while True:
@@ -362,11 +392,15 @@ class ServerState:
                 ]
 
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                # Force-kill remaining tasks
-                for task in pending:
-                    task.cancel()
+                task_names = {tasks[0]: "recv_loop", tasks[1]: "opus_loop", tasks[2]: "send_loop"}
+                for t in done:
+                    exc = t.exception() if not t.cancelled() else None
+                    clog.log("info", f"FIRST_COMPLETED: {task_names.get(t, '?')} finished (exception={exc})")
+                for t in pending:
+                    clog.log("info", f"FIRST_COMPLETED: cancelling {task_names.get(t, '?')}")
+                    t.cancel()
                     try:
-                        await task
+                        await t
                     except asyncio.CancelledError:
                         pass
                 await ws.close()
